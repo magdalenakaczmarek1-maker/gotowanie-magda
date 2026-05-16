@@ -1,6 +1,6 @@
 """
 Kuchnia — kucharski asystent
-Stack: Streamlit + Google Gemini (najprostsza wersja)
+Stack: Streamlit + Google Gemini (z ochroną przed duplikatami)
 """
 import streamlit as st
 import google.generativeai as genai
@@ -22,8 +22,13 @@ except (KeyError, FileNotFoundError):
 
 1. Wejdź na **[aistudio.google.com/apikey](https://aistudio.google.com/apikey)**
 2. Kliknij „Create API key" → skopiuj klucz (zaczyna się od `AIza...`)
-3. Na Streamlit Cloud: ⋯ → Settings → Secrets, wklej: GOOGLE_API_KEY = "AIzaSyCZfB0NY8GCD4yU_9RgkCrUMxRkiDsIsv8"
-    4. Save → Reboot app
+3. Na Streamlit Cloud: ⋯ → Settings → Secrets, wklej: AIzaSyCZfB0NY8GCD4yU_9RgkCrUMxRkiDsIsv8
+
+```
+GOOGLE_API_KEY = "AIza..."
+```
+
+4. Save → Reboot app
     """)
     st.stop()
 
@@ -130,6 +135,7 @@ def init_state():
     st.session_state.fridge    = list(DEFAULT_FRIDGE)
     st.session_state.equipment = list(DEFAULT_EQUIPMENT)
     st.session_state.shopping  = []
+    st.session_state._processed_files = set()
     st.session_state._loaded = True
 
 init_state()
@@ -153,6 +159,9 @@ def extract_json(text, kind="object"):
         return json.loads(cleaned[s:e + 1])
     return json.loads(cleaned)
 
+def normalize_name(name):
+    return (name or "").strip().lower()
+
 def add_to_shopping(items):
     existing = {x["name"].lower() for x in st.session_state.shopping}
     added = 0
@@ -168,8 +177,7 @@ st.markdown("# 🍳 Kuchnia")
 st.caption("Twój kucharski asystent — Gemini AI")
 
 st.info(
-    "💡 Dane są w pamięci sesji. **Pobierz backup JSON** z zakładki Przepisy "
-    "po dodaniu pierwszych przepisów, żeby je zachować."
+    "💡 Dane są w pamięci sesji. **Pobierz backup JSON** po dodaniu pierwszych przepisów."
 )
 
 tab_recipes, tab_fridge, tab_ask, tab_shopping = st.tabs([
@@ -184,32 +192,67 @@ with tab_recipes:
 
     uploaded = st.file_uploader("Wgraj plik .docx", type=["docx"], key="docx_uploader")
     if uploaded is not None:
-        with st.spinner("Czytam dokument…"):
-            try:
-                text = parse_docx(uploaded.read())
-                if not text.strip():
-                    st.error("Pusty dokument.")
-                else:
-                    with st.spinner("Analizuję przepisy (10–30 sek)…"):
-                        prompt = f"""Wyodrębnij wszystkie przepisy z tekstu. Zwróć WYŁĄCZNIE czysty JSON, bez markdown. Format:
+        file_signature = f"{uploaded.name}_{uploaded.size}"
+        if file_signature in st.session_state._processed_files:
+            st.warning(
+                f"⚠️ Plik **{uploaded.name}** był już wgrany w tej sesji — pomijam, "
+                "żeby nie duplikować. Jeśli chcesz wgrać go ponownie, kliknij ❌ obok pliku."
+            )
+        else:
+            with st.spinner("Czytam dokument…"):
+                try:
+                    text = parse_docx(uploaded.read())
+                    if not text.strip():
+                        st.error("Pusty dokument.")
+                    else:
+                        with st.spinner("Analizuję przepisy (10–30 sek)…"):
+                            prompt = f"""Wyodrębnij wszystkie przepisy z tekstu. Zwróć WYŁĄCZNIE czysty JSON, bez markdown. Format:
 [{{"name":"nazwa","category":"śniadanie|obiad|kolacja|deser|przekąska|inne","time":liczba_minut,"tags":["łatwy","airfryer","mięsne","wege"],"ingredients":[{{"name":"składnik","amount":"ilość"}}],"instructions":"kroki","tools":["airfryer","termomix","piekarnik","płyta indukcyjna"]}}]
 
 Polski. Czas w minutach (szacuj jeśli brak).
 
 TEKST:
-{text[:12000]}"""
-                        raw = call_gemini(prompt)
-                        new_recipes = extract_json(raw, kind="array")
-                        ts = int(time.time() * 1000)
-                        for i, r in enumerate(new_recipes):
-                            r["id"] = f"r_{ts}_{i}"
-                        st.session_state.recipes.extend(new_recipes)
-                        st.success(f"✓ Dodano {len(new_recipes)} przepisów")
-                        st.rerun()
-            except Exception as e:
-                st.error(f"Błąd: {e}")
+{text[:25000]}"""
+                            raw = call_gemini(prompt)
+                            new_recipes = extract_json(raw, kind="array")
 
-    with st.expander("💾 Backup / Przywracanie"):
+                            # ANTY-DUPLIKAT po nazwie
+                            existing_names = {
+                                normalize_name(r.get("name", ""))
+                                for r in st.session_state.recipes
+                            }
+                            added_recipes = []
+                            skipped_count = 0
+                            ts = int(time.time() * 1000)
+                            for i, r in enumerate(new_recipes):
+                                nm = normalize_name(r.get("name", ""))
+                                if not nm or nm in existing_names:
+                                    skipped_count += 1
+                                    continue
+                                r["id"] = f"r_{ts}_{i}"
+                                added_recipes.append(r)
+                                existing_names.add(nm)
+
+                            st.session_state.recipes.extend(added_recipes)
+                            st.session_state._processed_files.add(file_signature)
+
+                            if added_recipes and skipped_count:
+                                st.success(
+                                    f"✓ Dodano {len(added_recipes)} nowych. "
+                                    f"Pominięto {skipped_count} duplikatów."
+                                )
+                            elif added_recipes:
+                                st.success(f"✓ Dodano {len(added_recipes)} przepisów")
+                            else:
+                                st.warning(
+                                    f"Nic nie dodano — {skipped_count} przepisów już jest w bibliotece."
+                                )
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"Błąd: {e}")
+
+    # Backup / Import / Wyczyść
+    with st.expander("💾 Backup / Przywracanie / Wyczyść wszystko"):
         col1, col2 = st.columns(2)
         with col1:
             if st.session_state.recipes:
@@ -234,6 +277,17 @@ TEKST:
                         st.rerun()
                 except Exception as e:
                     st.error(f"Błąd: {e}")
+
+        st.markdown("---")
+        st.markdown("**🗑️ Strefa niebezpieczna**")
+        st.caption("Usuwa wszystkie przepisy. Najpierw pobierz backup, jeśli chcesz go zachować!")
+        confirm = st.checkbox("Tak, na pewno", key="confirm_clear")
+        if confirm and st.button("🗑️ USUŃ WSZYSTKIE PRZEPISY", use_container_width=True):
+            st.session_state.recipes = []
+            st.session_state._processed_files = set()
+            st.session_state["confirm_clear"] = False
+            st.success("✓ Wyczyszczono")
+            st.rerun()
 
     if st.session_state.recipes:
         st.markdown("---")
