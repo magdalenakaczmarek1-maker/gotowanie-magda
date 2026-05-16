@@ -22,7 +22,7 @@ except (KeyError, FileNotFoundError):
 
 1. Wejdź na **[aistudio.google.com/apikey](https://aistudio.google.com/apikey)**
 2. Kliknij „Create API key" → skopiuj klucz (zaczyna się od `AIza...`)
-3. Na Streamlit Cloud: ⋯ → Settings → Secrets, wklej: GOOGLE_API_KEY = "AIzaSyDkBgSeSz4GcPNneevcE2ofL8M8qwb4Rq4"
+3. Na Streamlit Cloud: ⋯ → Settings → Secrets, wklej: GOOGLE_API_KEY = "AIzaSyB2UZjOU_99F2_ntIM0BLOSlLR7Yz4DDzg"
     4. Save → Reboot app
     """)
     st.stop()
