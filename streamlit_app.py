@@ -1,84 +1,34 @@
 """
 Kuchnia — kucharski asystent
-Stack: Streamlit + Gemini (Vertex AI) + Firebase Firestore
+Stack: Streamlit + Google Gemini (najprostsza wersja)
 """
 import streamlit as st
-import vertexai
-from vertexai.generative_models import GenerativeModel
-from google.cloud import firestore
-from google.oauth2 import service_account
+import google.generativeai as genai
 from docx import Document
 import json
 import io
 import re
 import time
 
-# ── Konfiguracja strony ──────────────────────────────────
 st.set_page_config(page_title="Kuchnia", page_icon="🍳", layout="centered")
 
-# ── Sekrety ──────────────────────────────────────────────
-def need(key):
-    try:
-        return st.secrets[key]
-    except (KeyError, FileNotFoundError):
-        st.error(f"⚠️ Brak sekretu: `{key}` — ustaw w Streamlit Cloud → Settings → Secrets")
-        st.stop()
-
-ADMIN_PASSWORD       = need("ADMIN_PASSWORD")
-GCP_PROJECT_ID       = need("GCP_PROJECT_ID")
-GCP_LOCATION         = st.secrets.get("GCP_LOCATION", "us-central1")
-FIREBASE_CREDS_JSON  = need("FIREBASE_CREDS")
-MODEL_NAME           = st.secrets.get("VERTEX_MODEL", "gemini-2.5-flash")
-
-# ── Inicjalizacja Vertex + Firestore ─────────────────────
-@st.cache_resource
-def get_clients():
-    creds_dict = json.loads(FIREBASE_CREDS_JSON)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-    )
-    vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION, credentials=creds)
-    model = GenerativeModel(MODEL_NAME)
-    db = firestore.Client(project=GCP_PROJECT_ID, credentials=creds)
-    return model, db
-
+# ── Klucz API ────────────────────────────────────────────
 try:
-    gemini, db = get_clients()
-except Exception as e:
-    st.error(f"❌ Błąd Google Cloud: {e}")
+    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+except (KeyError, FileNotFoundError):
+    st.error("⚠️ Brak klucza GOOGLE_API_KEY")
     st.markdown("""
-**Sprawdź:**
-- `FIREBASE_CREDS` jest poprawnym JSON (otoczony `'''`)
-- W projekcie `roboczy-bez-limitu` jest włączony **Vertex AI API** i **Firestore API**
-- Service account ma role: **Vertex AI User**, **Cloud Datastore User**
-- W `GCP_LOCATION` model `gemini-2.5-flash` jest dostępny (sprawdzone: `us-central1`)
+**Co zrobić:**
+
+1. Wejdź na **[aistudio.google.com/apikey](https://aistudio.google.com/apikey)**
+2. Kliknij „Create API key" → skopiuj klucz (zaczyna się od `AIza...`)
+3. Na Streamlit Cloud: ⋯ → Settings → Secrets, wklej: GOOGLE_API_KEY = "AIzaSyDkBgSeSz4GcPNneevcE2ofL8M8qwb4Rq4"
+    4. Save → Reboot app
     """)
     st.stop()
 
-# ── Login ────────────────────────────────────────────────
-if "auth" not in st.session_state:
-    st.session_state.auth = False
-if "user" not in st.session_state:
-    st.session_state.user = None
-
-if not st.session_state.auth:
-    st.markdown("# 🍳 Kuchnia")
-    st.caption("Zaloguj się")
-    with st.form("login"):
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            who = st.text_input("Imię", placeholder="np. Magda")
-        with col2:
-            pwd = st.text_input("Hasło", type="password")
-        if st.form_submit_button("Wejdź", type="primary", use_container_width=True):
-            if pwd == ADMIN_PASSWORD and who.strip():
-                st.session_state.auth = True
-                st.session_state.user = who.strip()
-                st.rerun()
-            else:
-                st.error("Złe hasło lub puste imię")
-    st.stop()
+genai.configure(api_key=GOOGLE_API_KEY)
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 # ── Stała baza ───────────────────────────────────────────
 CATEGORIES = [
@@ -172,53 +122,15 @@ QUICK_PROMPTS = [
     "Urodziny dziecka — obiad i przekąski",
 ]
 
-# ── Firestore ────────────────────────────────────────────
-def _doc(name):
-    return db.collection("kuchnia").document(name)
-
-def fs_load(name, default):
-    try:
-        snap = _doc(name).get()
-        if snap.exists:
-            return snap.to_dict().get("items", default)
-    except Exception as e:
-        st.warning(f"Odczyt {name}: {e}")
-    return default
-
-def fs_save(name, items):
-    try:
-        _doc(name).set({
-            "items": items,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-            "updated_by": st.session_state.user,
-        })
-    except Exception as e:
-        st.error(f"Zapis {name}: {e}")
-
-def fs_init(name, default):
-    try:
-        snap = _doc(name).get()
-        if not snap.exists:
-            fs_save(name, default)
-            return default
-        return snap.to_dict().get("items", default)
-    except Exception:
-        return default
-
+# ── Stan sesji ───────────────────────────────────────────
 def init_state():
     if st.session_state.get("_loaded"):
         return
-    with st.spinner("Wczytuję dane…"):
-        st.session_state.recipes   = fs_load("recipes", [])
-        st.session_state.fridge    = fs_init("fridge", list(DEFAULT_FRIDGE))
-        st.session_state.equipment = fs_init("equipment", list(DEFAULT_EQUIPMENT))
-        st.session_state.shopping  = fs_load("shopping", [])
+    st.session_state.recipes   = []
+    st.session_state.fridge    = list(DEFAULT_FRIDGE)
+    st.session_state.equipment = list(DEFAULT_EQUIPMENT)
+    st.session_state.shopping  = []
     st.session_state._loaded = True
-
-def save_recipes():   fs_save("recipes",   st.session_state.recipes)
-def save_fridge():    fs_save("fridge",    st.session_state.fridge)
-def save_equipment(): fs_save("equipment", st.session_state.equipment)
-def save_shopping():  fs_save("shopping",  st.session_state.shopping)
 
 init_state()
 
@@ -228,7 +140,7 @@ def parse_docx(file_bytes):
     return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
 def call_gemini(prompt):
-    response = gemini.generate_content(prompt)
+    response = model.generate_content(prompt)
     return response.text.strip()
 
 def extract_json(text, kind="object"):
@@ -246,29 +158,19 @@ def add_to_shopping(items):
     added = 0
     for ing in items:
         if ing and ing.lower() not in existing:
-            st.session_state.shopping.append({
-                "name": ing, "bought": False, "added_by": st.session_state.user,
-            })
+            st.session_state.shopping.append({"name": ing, "bought": False})
             existing.add(ing.lower())
             added += 1
-    if added:
-        save_shopping()
     return added
 
-# ── Górny pasek ──────────────────────────────────────────
-top_l, top_r = st.columns([4, 1])
-with top_l:
-    st.markdown("# 🍳 Kuchnia")
-    st.caption(f"**{st.session_state.user}** ☁️ Synchronizacja w chmurze")
-with top_r:
-    st.write("")
-    if st.button("🔄 Odśwież", use_container_width=True):
-        st.session_state._loaded = False
-        st.rerun()
-    if st.button("🚪 Wyloguj", use_container_width=True):
-        for k in list(st.session_state.keys()):
-            del st.session_state[k]
-        st.rerun()
+# ── Nagłówek ─────────────────────────────────────────────
+st.markdown("# 🍳 Kuchnia")
+st.caption("Twój kucharski asystent — Gemini AI")
+
+st.info(
+    "💡 Dane są w pamięci sesji. **Pobierz backup JSON** z zakładki Przepisy "
+    "po dodaniu pierwszych przepisów, żeby je zachować."
+)
 
 tab_recipes, tab_fridge, tab_ask, tab_shopping = st.tabs([
     "📖 Przepisy", "🥬 Lodówka", "✨ Zapytaj", "🛒 Zakupy",
@@ -278,7 +180,7 @@ tab_recipes, tab_fridge, tab_ask, tab_shopping = st.tabs([
 with tab_recipes:
     st.subheader("Moje przepisy")
     n = len(st.session_state.recipes)
-    st.caption(f"📚 {n} przepisów w bibliotece" if n else "Wgraj dokument Word — AI go odczyta.")
+    st.caption(f"📚 {n} przepisów" if n else "Wgraj dokument Word — AI go odczyta.")
 
     uploaded = st.file_uploader("Wgraj plik .docx", type=["docx"], key="docx_uploader")
     if uploaded is not None:
@@ -301,21 +203,43 @@ TEKST:
                         ts = int(time.time() * 1000)
                         for i, r in enumerate(new_recipes):
                             r["id"] = f"r_{ts}_{i}"
-                            r["added_by"] = st.session_state.user
                         st.session_state.recipes.extend(new_recipes)
-                        save_recipes()
                         st.success(f"✓ Dodano {len(new_recipes)} przepisów")
                         st.rerun()
             except Exception as e:
                 st.error(f"Błąd: {e}")
+
+    with st.expander("💾 Backup / Przywracanie"):
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.session_state.recipes:
+                st.download_button(
+                    "📥 Pobierz backup",
+                    data=json.dumps(st.session_state.recipes, ensure_ascii=False, indent=2),
+                    file_name=f"kuchnia-{int(time.time())}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            else:
+                st.caption("Brak przepisów do zapisania.")
+        with col2:
+            backup = st.file_uploader("Wgraj backup", type=["json"], key="backup_upload",
+                                       label_visibility="collapsed")
+            if backup is not None:
+                try:
+                    data = json.loads(backup.read())
+                    if isinstance(data, list):
+                        st.session_state.recipes = data
+                        st.success("✓ Przywrócono")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Błąd: {e}")
 
     if st.session_state.recipes:
         st.markdown("---")
         for r in st.session_state.recipes:
             label = f"**{r.get('name','?')}**  ·  {r.get('category','')}  ·  ~{r.get('time','?')} min"
             with st.expander(label):
-                if r.get("added_by"):
-                    st.caption(f"Dodał(a): {r['added_by']}")
                 if r.get("tags"):
                     st.caption("🏷️ " + "  ·  ".join(r["tags"]))
                 if r.get("tools"):
@@ -331,18 +255,7 @@ TEKST:
                     st.session_state.recipes = [
                         x for x in st.session_state.recipes if x.get("id") != r.get("id")
                     ]
-                    save_recipes()
                     st.rerun()
-
-    with st.expander("💾 Backup"):
-        if st.session_state.recipes:
-            st.download_button(
-                "📥 Pobierz JSON",
-                data=json.dumps(st.session_state.recipes, ensure_ascii=False, indent=2),
-                file_name=f"kuchnia-{int(time.time())}.json",
-                mime="application/json",
-                use_container_width=True,
-            )
 
 # ─── LODÓWKA ─────────────────────────────────────────────
 with tab_fridge:
@@ -355,7 +268,6 @@ with tab_fridge:
             with eq_cols[i % len(eq_cols)]:
                 if st.button(f"❌ {e}", key=f"eq_{i}_{e}", use_container_width=True):
                     st.session_state.equipment = [x for x in st.session_state.equipment if x != e]
-                    save_equipment()
                     st.rerun()
 
     with st.form("add_eq", clear_on_submit=True):
@@ -368,7 +280,6 @@ with tab_fridge:
             name = new_eq.strip()
             if name.lower() not in [e.lower() for e in st.session_state.equipment]:
                 st.session_state.equipment.append(name)
-                save_equipment()
                 st.rerun()
 
     st.markdown("---")
@@ -386,7 +297,6 @@ with tab_fridge:
             name = new_item.strip()
             if name.lower() not in [f["name"].lower() for f in st.session_state.fridge]:
                 st.session_state.fridge.append({"name": name, "category": cat_options[sel]})
-                save_fridge()
                 st.rerun()
 
     st.markdown("---")
@@ -404,7 +314,6 @@ with tab_fridge:
                     st.session_state.fridge = [
                         x for x in st.session_state.fridge if x["name"] != item["name"]
                     ]
-                    save_fridge()
                     st.rerun()
 
 # ─── ZAPYTAJ ─────────────────────────────────────────────
@@ -560,7 +469,6 @@ Zwróć WYŁĄCZNIE czysty JSON, bez markdown:
                                         st.session_state.fridge.append({
                                             "name": p.get("name", ""), "category": cat_id,
                                         })
-                                        save_fridge()
                                         st.rerun()
 
 # ─── ZAKUPY ──────────────────────────────────────────────
@@ -593,17 +501,12 @@ with tab_shopping:
             with cols[0]:
                 if st.button("☐", key=f"chk_{i}_{item['name']}"):
                     st.session_state.shopping[i]["bought"] = True
-                    save_shopping()
                     st.rerun()
             with cols[1]:
-                label = item["name"]
-                if item.get("added_by"):
-                    label += f"  *· {item['added_by']}*"
-                st.markdown(label)
+                st.markdown(item["name"])
             with cols[2]:
                 if st.button("🗑️", key=f"del_shop_{i}_{item['name']}"):
                     del st.session_state.shopping[i]
-                    save_shopping()
                     st.rerun()
 
     if bought:
@@ -615,7 +518,6 @@ with tab_shopping:
             with cols[0]:
                 if st.button("✓", key=f"unchk_{i}_{item['name']}"):
                     st.session_state.shopping[i]["bought"] = False
-                    save_shopping()
                     st.rerun()
             with cols[1]:
                 st.markdown(f"~~{item['name']}~~")
@@ -624,5 +526,4 @@ with tab_shopping:
             st.session_state.shopping = [
                 s for s in st.session_state.shopping if not s.get("bought")
             ]
-            save_shopping()
             st.rerun()
