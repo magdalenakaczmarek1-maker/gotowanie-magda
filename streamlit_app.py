@@ -28,21 +28,85 @@ COL_FRIDGE   = "kuchnia_fridge"
 COL_SHOPPING = "kuchnia_shopping"
 COL_META     = "kuchnia_meta"
 
+def _fb_debug(msg):
+    """Dopisuje krok do diagnostyki Firebase."""
+    if "_firebase_debug" not in st.session_state:
+        st.session_state["_firebase_debug"] = []
+    st.session_state["_firebase_debug"].append(msg)
+
 @st.cache_resource(show_spinner=False)
 def get_db():
     """Łączy z Firebase. Zwraca None jeśli błąd."""
+    debug = []
     try:
+        debug.append("KROK 1: Próba importu firebase_admin...")
         import firebase_admin
         from firebase_admin import credentials, firestore
+        debug.append("✓ KROK 1 OK — firebase_admin zaimportowany")
+
         if not firebase_admin._apps:
+            debug.append("KROK 2: Pobieram FIREBASE_CREDS z Secrets...")
             raw = st.secrets.get("FIREBASE_CREDS")
             if not raw:
+                # Może to sekcja TOML zamiast stringa?
+                if "firebase" in st.secrets:
+                    debug.append("✓ KROK 2 OK — znaleziono sekcję [firebase] (format TOML)")
+                    creds_dict = dict(st.secrets["firebase"])
+                else:
+                    debug.append("✗ KROK 2 BŁĄD — Secrets nie zawiera ani FIREBASE_CREDS ani [firebase]")
+                    st.session_state["_firebase_debug"] = debug
+                    return None
+            else:
+                if isinstance(raw, str):
+                    debug.append(f"✓ KROK 2 OK — pobrano string FIREBASE_CREDS ({len(raw)} znaków)")
+                    debug.append("KROK 3: Parsuję JSON...")
+                    try:
+                        creds_dict = json.loads(raw)
+                        debug.append(f"✓ KROK 3 OK — JSON sparsowany, klucze: {list(creds_dict.keys())[:5]}...")
+                    except json.JSONDecodeError as je:
+                        debug.append(f"✗ KROK 3 BŁĄD JSON: {je}")
+                        debug.append(f"   Pierwsze 60 znaków raw: {repr(raw[:60])}")
+                        debug.append(f"   Ostatnie 60 znaków raw: {repr(raw[-60:])}")
+                        st.session_state["_firebase_debug"] = debug
+                        st.session_state["_firebase_error"] = str(je)
+                        return None
+                else:
+                    debug.append(f"✓ KROK 2 OK — pobrano obiekt (typ: {type(raw).__name__})")
+                    creds_dict = dict(raw)
+
+            debug.append(f"KROK 4: Sprawdzam wymagane pola...")
+            required = ["type", "project_id", "private_key_id", "private_key", "client_email"]
+            missing = [f for f in required if f not in creds_dict]
+            if missing:
+                debug.append(f"✗ KROK 4 BŁĄD — brakuje pól: {missing}")
+                debug.append(f"   Pola które są: {list(creds_dict.keys())}")
+                st.session_state["_firebase_debug"] = debug
                 return None
-            creds_dict = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            debug.append(f"✓ KROK 4 OK — wszystkie wymagane pola są")
+            debug.append(f"   project_id = '{creds_dict.get('project_id', '?')}'")
+            debug.append(f"   client_email = '{creds_dict.get('client_email', '?')[:40]}...'")
+            pk = creds_dict.get("private_key", "")
+            debug.append(f"   private_key zaczyna się od: {repr(pk[:30])}")
+            debug.append(f"   private_key kończy się na: {repr(pk[-30:])}")
+            debug.append(f"   liczba '\\n' w private_key: {pk.count(chr(92)+'n')}")
+            debug.append(f"   liczba prawdziwych nowych linii: {pk.count(chr(10))}")
+
+            debug.append("KROK 5: Tworzę credentials.Certificate...")
             cred = credentials.Certificate(creds_dict)
+            debug.append("✓ KROK 5 OK — credentials utworzone")
+
+            debug.append("KROK 6: initialize_app...")
             firebase_admin.initialize_app(cred)
-        return firestore.client()
+            debug.append("✓ KROK 6 OK — Firebase zainicjalizowany")
+
+        debug.append("KROK 7: Tworzę klienta Firestore...")
+        client = firestore.client()
+        debug.append("✓ KROK 7 OK — Firestore połączony! 🎉")
+        st.session_state["_firebase_debug"] = debug
+        return client
     except Exception as e:
+        debug.append(f"✗ NIEOCZEKIWANY BŁĄD: {type(e).__name__}: {e}")
+        st.session_state["_firebase_debug"] = debug
         st.session_state["_firebase_error"] = str(e)
         return None
 
@@ -306,6 +370,15 @@ else:
         "(dane znikają po zamknięciu)."
         + (f"\n\nBłąd: {err}" if err else "")
     )
+
+# 🔍 Okienko diagnostyczne Firebase (zawsze widoczne dopóki Firebase nie działa)
+with st.expander("🔍 Firebase debug — kliknij żeby zobaczyć szczegóły", expanded=not USING_FIREBASE):
+    debug_lines = st.session_state.get("_firebase_debug", [])
+    if debug_lines:
+        st.code("\n".join(debug_lines), language="text")
+        st.caption("☝️ Skopiuj cały tekst powyżej i wyślij Claudeowi (klikając przycisk kopiowania w prawym górnym rogu okienka)")
+    else:
+        st.caption("Brak diagnostyki — uruchom apkę ponownie (Reboot app w Streamlit Cloud)")
 
 tab_recipes, tab_fridge, tab_ask, tab_shopping = st.tabs([
     "📖 Przepisy", "🥬 Lodówka", "✨ Zapytaj", "🛒 Zakupy",
