@@ -1,6 +1,6 @@
 """
 Kuchnia — kucharski asystent
-Stack: Streamlit + Google Gemini (z ochroną przed duplikatami)
+Stack: Streamlit + Google Gemini + Firebase Firestore (trwała baza)
 """
 import streamlit as st
 import google.generativeai as genai
@@ -12,30 +12,44 @@ import time
 
 st.set_page_config(page_title="Kuchnia", page_icon="🍳", layout="centered")
 
-# ── Klucz API ────────────────────────────────────────────
+# ── Klucz Gemini ─────────────────────────────────────────
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 except (KeyError, FileNotFoundError):
-    st.error("⚠️ Brak klucza GOOGLE_API_KEY")
-    st.markdown("""
-**Co zrobić:**
-
-1. Wejdź na **[aistudio.google.com/apikey](https://aistudio.google.com/apikey)**
-2. Kliknij „Create API key" → skopiuj klucz (zaczyna się od `AIza...`)
-3. Na Streamlit Cloud: ⋯ → Settings → Secrets, wklej: "AIza..."
-
-```
-GOOGLE_API_KEY = "AIza..."
-```
-
-4. Save → Reboot app
-    """)
+    st.error("⚠️ Brak klucza GOOGLE_API_KEY w Streamlit Secrets")
     st.stop()
 
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
-# ── Stała baza ───────────────────────────────────────────
+# ── Firebase Firestore ───────────────────────────────────
+COL_RECIPES  = "kuchnia_recipes"
+COL_FRIDGE   = "kuchnia_fridge"
+COL_SHOPPING = "kuchnia_shopping"
+COL_META     = "kuchnia_meta"
+
+@st.cache_resource(show_spinner=False)
+def get_db():
+    """Łączy z Firebase. Zwraca None jeśli błąd."""
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+        if not firebase_admin._apps:
+            raw = st.secrets.get("FIREBASE_CREDS")
+            if not raw:
+                return None
+            creds_dict = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            cred = credentials.Certificate(creds_dict)
+            firebase_admin.initialize_app(cred)
+        return firestore.client()
+    except Exception as e:
+        st.session_state["_firebase_error"] = str(e)
+        return None
+
+db = get_db()
+USING_FIREBASE = db is not None
+
+# ── Stała baza domyślna ──────────────────────────────────
 CATEGORIES = [
     {"id": "warzywa",     "label": "Warzywa i owoce",        "emoji": "🥬"},
     {"id": "mieso",       "label": "Mięso i ryby",           "emoji": "🥩"},
@@ -127,14 +141,119 @@ QUICK_PROMPTS = [
     "Urodziny dziecka — obiad i przekąski",
 ]
 
-# ── Stan sesji ───────────────────────────────────────────
+# ── Operacje na bazie ─────────────────────────────────────
+def db_load_recipes():
+    if not db:
+        return []
+    docs = db.collection(COL_RECIPES).stream()
+    out = []
+    for d in docs:
+        r = d.to_dict()
+        r["id"] = d.id
+        out.append(r)
+    return out
+
+def db_save_recipe(recipe):
+    if not db:
+        return None
+    rid = recipe.get("id") or f"r_{int(time.time()*1000)}_{len(recipe.get('name',''))}"
+    doc_data = {k: v for k, v in recipe.items() if k != "id"}
+    db.collection(COL_RECIPES).document(rid).set(doc_data)
+    recipe["id"] = rid
+    return rid
+
+def db_delete_recipe(rid):
+    if not db or not rid:
+        return
+    db.collection(COL_RECIPES).document(rid).delete()
+
+def db_delete_all_recipes():
+    if not db:
+        return
+    for d in db.collection(COL_RECIPES).stream():
+        d.reference.delete()
+
+def db_load_fridge():
+    if not db:
+        return None
+    docs = list(db.collection(COL_FRIDGE).stream())
+    if not docs:
+        return None
+    return [{**d.to_dict(), "_id": d.id} for d in docs]
+
+def db_save_fridge_full(items):
+    if not db:
+        return
+    for d in db.collection(COL_FRIDGE).stream():
+        d.reference.delete()
+    for it in items:
+        db.collection(COL_FRIDGE).add({
+            "name": it.get("name", ""),
+            "category": it.get("category", "inne"),
+        })
+
+def db_load_shopping():
+    if not db:
+        return None
+    docs = list(db.collection(COL_SHOPPING).stream())
+    if not docs:
+        return []
+    return [{**d.to_dict(), "_id": d.id} for d in docs]
+
+def db_save_shopping_full(items):
+    if not db:
+        return
+    for d in db.collection(COL_SHOPPING).stream():
+        d.reference.delete()
+    for it in items:
+        db.collection(COL_SHOPPING).add({
+            "name": it.get("name", ""),
+            "bought": bool(it.get("bought", False)),
+        })
+
+def db_load_equipment():
+    if not db:
+        return None
+    doc = db.collection(COL_META).document("equipment").get()
+    if not doc.exists:
+        return None
+    return doc.to_dict().get("items", DEFAULT_EQUIPMENT)
+
+def db_save_equipment(items):
+    if not db:
+        return
+    db.collection(COL_META).document("equipment").set({"items": items})
+
+# ── Inicjalizacja stanu ───────────────────────────────────
 def init_state():
     if st.session_state.get("_loaded"):
         return
-    st.session_state.recipes   = []
-    st.session_state.fridge    = list(DEFAULT_FRIDGE)
-    st.session_state.equipment = list(DEFAULT_EQUIPMENT)
-    st.session_state.shopping  = []
+
+    if USING_FIREBASE:
+        st.session_state.recipes = db_load_recipes()
+
+        fridge = db_load_fridge()
+        if fridge is None:
+            db_save_fridge_full(DEFAULT_FRIDGE)
+            st.session_state.fridge = list(DEFAULT_FRIDGE)
+        else:
+            st.session_state.fridge = fridge
+
+        eq = db_load_equipment()
+        if eq is None:
+            db_save_equipment(DEFAULT_EQUIPMENT)
+            st.session_state.equipment = list(DEFAULT_EQUIPMENT)
+        else:
+            st.session_state.equipment = eq
+
+        sh = db_load_shopping()
+        st.session_state.shopping = sh if sh is not None else []
+    else:
+        st.session_state.recipes   = []
+        st.session_state.fridge    = list(DEFAULT_FRIDGE)
+        st.session_state.equipment = list(DEFAULT_EQUIPMENT)
+        st.session_state.shopping  = []
+
     st.session_state._processed_files = set()
     st.session_state._loaded = True
 
@@ -170,15 +289,23 @@ def add_to_shopping(items):
             st.session_state.shopping.append({"name": ing, "bought": False})
             existing.add(ing.lower())
             added += 1
+    if USING_FIREBASE and added:
+        db_save_shopping_full(st.session_state.shopping)
     return added
 
 # ── Nagłówek ─────────────────────────────────────────────
 st.markdown("# 🍳 Kuchnia")
 st.caption("Twój kucharski asystent — Gemini AI")
 
-st.info(
-    "💡 Dane są w pamięci sesji. **Pobierz backup JSON** po dodaniu pierwszych przepisów."
-)
+if USING_FIREBASE:
+    st.success("☁️ Połączono z Firebase — przepisy zapisują się automatycznie")
+else:
+    err = st.session_state.get("_firebase_error", "")
+    st.warning(
+        "⚠️ Firebase niedostępny — apka działa w trybie sesji "
+        "(dane znikają po zamknięciu)."
+        + (f"\n\nBłąd: {err}" if err else "")
+    )
 
 tab_recipes, tab_fridge, tab_ask, tab_shopping = st.tabs([
     "📖 Przepisy", "🥬 Lodówka", "✨ Zapytaj", "🛒 Zakupy",
@@ -195,8 +322,7 @@ with tab_recipes:
         file_signature = f"{uploaded.name}_{uploaded.size}"
         if file_signature in st.session_state._processed_files:
             st.warning(
-                f"⚠️ Plik **{uploaded.name}** był już wgrany w tej sesji — pomijam, "
-                "żeby nie duplikować. Jeśli chcesz wgrać go ponownie, kliknij ❌ obok pliku."
+                f"⚠️ Plik **{uploaded.name}** był już wgrany w tej sesji — pomijam."
             )
         else:
             with st.spinner("Czytam dokument…"):
@@ -216,20 +342,21 @@ TEKST:
                             raw = call_gemini(prompt)
                             new_recipes = extract_json(raw, kind="array")
 
-                            # ANTY-DUPLIKAT po nazwie
                             existing_names = {
                                 normalize_name(r.get("name", ""))
                                 for r in st.session_state.recipes
                             }
                             added_recipes = []
                             skipped_count = 0
-                            ts = int(time.time() * 1000)
-                            for i, r in enumerate(new_recipes):
+                            for r in new_recipes:
                                 nm = normalize_name(r.get("name", ""))
                                 if not nm or nm in existing_names:
                                     skipped_count += 1
                                     continue
-                                r["id"] = f"r_{ts}_{i}"
+                                if USING_FIREBASE:
+                                    db_save_recipe(r)
+                                else:
+                                    r["id"] = f"r_{int(time.time()*1000)}_{len(added_recipes)}"
                                 added_recipes.append(r)
                                 existing_names.add(nm)
 
@@ -245,13 +372,12 @@ TEKST:
                                 st.success(f"✓ Dodano {len(added_recipes)} przepisów")
                             else:
                                 st.warning(
-                                    f"Nic nie dodano — {skipped_count} przepisów już jest w bibliotece."
+                                    f"Nic nie dodano — {skipped_count} przepisów już jest."
                                 )
                             st.rerun()
                 except Exception as e:
                     st.error(f"Błąd: {e}")
 
-    # Backup / Import / Wyczyść
     with st.expander("💾 Backup / Przywracanie / Wyczyść wszystko"):
         col1, col2 = st.columns(2)
         with col1:
@@ -272,7 +398,10 @@ TEKST:
                 try:
                     data = json.loads(backup.read())
                     if isinstance(data, list):
-                        st.session_state.recipes = data
+                        if USING_FIREBASE:
+                            for r in data:
+                                db_save_recipe(r)
+                        st.session_state.recipes = data if not USING_FIREBASE else db_load_recipes()
                         st.success("✓ Przywrócono")
                         st.rerun()
                 except Exception as e:
@@ -280,9 +409,11 @@ TEKST:
 
         st.markdown("---")
         st.markdown("**🗑️ Strefa niebezpieczna**")
-        st.caption("Usuwa wszystkie przepisy. Najpierw pobierz backup, jeśli chcesz go zachować!")
+        st.caption("Usuwa wszystkie przepisy. Pobierz backup zanim klikniesz!")
         confirm = st.checkbox("Tak, na pewno", key="confirm_clear")
         if confirm and st.button("🗑️ USUŃ WSZYSTKIE PRZEPISY", use_container_width=True):
+            if USING_FIREBASE:
+                db_delete_all_recipes()
             st.session_state.recipes = []
             st.session_state._processed_files = set()
             st.session_state["confirm_clear"] = False
@@ -306,6 +437,8 @@ TEKST:
                     st.markdown("**Przygotowanie:**")
                     st.markdown(r["instructions"])
                 if st.button("🗑️ Usuń", key=f"del_{r.get('id','')}"):
+                    if USING_FIREBASE:
+                        db_delete_recipe(r.get("id"))
                     st.session_state.recipes = [
                         x for x in st.session_state.recipes if x.get("id") != r.get("id")
                     ]
@@ -322,6 +455,8 @@ with tab_fridge:
             with eq_cols[i % len(eq_cols)]:
                 if st.button(f"❌ {e}", key=f"eq_{i}_{e}", use_container_width=True):
                     st.session_state.equipment = [x for x in st.session_state.equipment if x != e]
+                    if USING_FIREBASE:
+                        db_save_equipment(st.session_state.equipment)
                     st.rerun()
 
     with st.form("add_eq", clear_on_submit=True):
@@ -334,6 +469,8 @@ with tab_fridge:
             name = new_eq.strip()
             if name.lower() not in [e.lower() for e in st.session_state.equipment]:
                 st.session_state.equipment.append(name)
+                if USING_FIREBASE:
+                    db_save_equipment(st.session_state.equipment)
                 st.rerun()
 
     st.markdown("---")
@@ -351,6 +488,8 @@ with tab_fridge:
             name = new_item.strip()
             if name.lower() not in [f["name"].lower() for f in st.session_state.fridge]:
                 st.session_state.fridge.append({"name": name, "category": cat_options[sel]})
+                if USING_FIREBASE:
+                    db_save_fridge_full(st.session_state.fridge)
                 st.rerun()
 
     st.markdown("---")
@@ -368,6 +507,8 @@ with tab_fridge:
                     st.session_state.fridge = [
                         x for x in st.session_state.fridge if x["name"] != item["name"]
                     ]
+                    if USING_FIREBASE:
+                        db_save_fridge_full(st.session_state.fridge)
                     st.rerun()
 
 # ─── ZAPYTAJ ─────────────────────────────────────────────
@@ -523,6 +664,8 @@ Zwróć WYŁĄCZNIE czysty JSON, bez markdown:
                                         st.session_state.fridge.append({
                                             "name": p.get("name", ""), "category": cat_id,
                                         })
+                                        if USING_FIREBASE:
+                                            db_save_fridge_full(st.session_state.fridge)
                                         st.rerun()
 
 # ─── ZAKUPY ──────────────────────────────────────────────
@@ -555,12 +698,16 @@ with tab_shopping:
             with cols[0]:
                 if st.button("☐", key=f"chk_{i}_{item['name']}"):
                     st.session_state.shopping[i]["bought"] = True
+                    if USING_FIREBASE:
+                        db_save_shopping_full(st.session_state.shopping)
                     st.rerun()
             with cols[1]:
                 st.markdown(item["name"])
             with cols[2]:
                 if st.button("🗑️", key=f"del_shop_{i}_{item['name']}"):
                     del st.session_state.shopping[i]
+                    if USING_FIREBASE:
+                        db_save_shopping_full(st.session_state.shopping)
                     st.rerun()
 
     if bought:
@@ -572,6 +719,8 @@ with tab_shopping:
             with cols[0]:
                 if st.button("✓", key=f"unchk_{i}_{item['name']}"):
                     st.session_state.shopping[i]["bought"] = False
+                    if USING_FIREBASE:
+                        db_save_shopping_full(st.session_state.shopping)
                     st.rerun()
             with cols[1]:
                 st.markdown(f"~~{item['name']}~~")
@@ -580,4 +729,6 @@ with tab_shopping:
             st.session_state.shopping = [
                 s for s in st.session_state.shopping if not s.get("bought")
             ]
+            if USING_FIREBASE:
+                db_save_shopping_full(st.session_state.shopping)
             st.rerun()
